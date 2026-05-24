@@ -14,7 +14,15 @@ const getBaseURL = () => {
     return "http://localhost:5000/api";
   }
   // Production: use env variable if available, otherwise use /api proxy
-  return import.meta.env.VITE_API_URL || "/api";
+  const configuredBaseURL = import.meta.env.VITE_API_URL || "/api";
+
+  // Ensure the API base always points at the backend API root
+  // Accept both https://domain.com and https://domain.com/api, but normalize to /api.
+  if (configuredBaseURL.endsWith("/api")) {
+    return configuredBaseURL;
+  }
+
+  return configuredBaseURL.replace(/\/$/, "") + "/api";
 };
 
 const api = axios.create({
