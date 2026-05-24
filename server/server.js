@@ -3,10 +3,13 @@
 
 // Load environment variables from .env file
 // Must be done before importing other modules that use process.env
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const connectDB = require("./config/db");
 const authRoutes = require("./routes/authRoutes");
 const { protect } = require("./middleware/authMiddleware");
@@ -16,16 +19,33 @@ const { authorize } = require("./middleware/roleMiddleware");
 const app = express();
 
 // ============================================
+// SECURITY MIDDLEWARE
+// ============================================
+
+// Helmet: Set secure HTTP headers
+// Protects app from various well-known web vulnerabilities
+app.use(helmet());
+
+// ============================================
 // MIDDLEWARE SETUP
 // ============================================
 
 // CORS Configuration
 // Allows frontend to communicate with backend
-// In production, update to specific frontend URL
+// Configured for both development and production
+const allowedOrigins = [
+  "http://localhost:3000", // Old dev port
+  "http://localhost:5173", // Vite dev server
+  process.env.CLIENT_URL, // Production frontend URL from env
+  process.env.FRONTEND_URL, // Alternative env variable
+].filter(Boolean); // Remove undefined values
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: allowedOrigins,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true, // Allow cookies to be sent with requests
+    optionsSuccessStatus: 200,
   })
 );
 
@@ -34,6 +54,43 @@ app.use(express.json());
 
 // Parse incoming form-encoded request bodies (max 10MB)
 app.use(express.urlencoded({ limit: "10mb", extended: true }));
+
+// ============================================
+// RATE LIMITING
+// ============================================
+
+// Rate limiting for authentication routes
+// Prevents brute force attacks on login/register
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Limit each IP to 10 requests per windowMs
+  message: {
+    success: false,
+    message:
+      "Too many authentication attempts from this IP. Please try again after 15 minutes.",
+  },
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.path === "/api/health";
+  },
+});
+
+// Rate limiting for general API routes
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per windowMs
+  message: {
+    success: false,
+    message: "Too many requests from this IP. Please try again later.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply general rate limiter to all /api routes
+app.use("/api/", apiLimiter);
 
 // ============================================
 // DATABASE CONNECTION
@@ -58,8 +115,9 @@ app.get("/api/health", (req, res) => {
 });
 
 // Authentication Routes
+// Apply stricter rate limiting to auth endpoints
 // All auth endpoints: /api/auth/register, /api/auth/login, /api/auth/me, /api/auth/logout
-app.use("/api/auth", authRoutes);
+app.use("/api/auth", authLimiter, authRoutes);
 
 // ============================================
 // PROTECTED ADMIN ROUTE (Example)
@@ -126,17 +184,69 @@ app.use((req, res) => {
 // ERROR HANDLING MIDDLEWARE
 // ============================================
 
-// Global error handler
-app.use((error, req, res, next) => {
-  console.error("Unhandled Error:", error);
+/**
+ * Global Error Handler Middleware
+ * Catches all errors and returns appropriate JSON response
+ * Handles specific error types like validation, auth, database errors
+ *
+ * Must be defined AFTER all routes and other middleware
+ * IMPORTANT: Must have 4 parameters (err, req, res, next) to be recognized as error middleware
+ */
+app.use((err, req, res, next) => {
+  // Log error for debugging
+  console.error("Global Error Handler:", {
+    message: err.message,
+    code: err.code,
+    name: err.name,
+    stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
+  });
 
-  const statusCode = error.statusCode || 500;
-  const message = error.message || "Internal Server Error";
+  let statusCode = err.statusCode || 500;
+  let message = err.message || "Internal Server Error";
 
+  // Handle specific MongoDB Cast Error (invalid object ID)
+  if (err.name === "CastError") {
+    statusCode = 400;
+    message = "Invalid ID format";
+  }
+
+  // Handle MongoDB Duplicate Key Error (e.g., duplicate email)
+  if (err.code === 11000) {
+    statusCode = 400;
+    const field = Object.keys(err.keyPattern)[0];
+    message = `${field.charAt(0).toUpperCase() + field.slice(1)} already exists`;
+  }
+
+  // Handle Mongoose Validation Error
+  if (err.name === "ValidationError") {
+    statusCode = 400;
+    const errors = Object.values(err.errors).map((e) => ({
+      field: e.path,
+      message: e.message,
+    }));
+    return res.status(statusCode).json({
+      success: false,
+      message: "Validation failed",
+      errors,
+    });
+  }
+
+  // Handle JWT Errors
+  if (err.name === "JsonWebTokenError") {
+    statusCode = 401;
+    message = "Invalid or malformed token";
+  }
+
+  if (err.name === "TokenExpiredError") {
+    statusCode = 401;
+    message = "Session expired. Please log in again";
+  }
+
+  // Return error response
   res.status(statusCode).json({
     success: false,
     message,
-    error: process.env.NODE_ENV === "development" ? error : undefined,
+    error: process.env.NODE_ENV === "development" ? err.message : undefined,
   });
 });
 
